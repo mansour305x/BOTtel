@@ -1,4 +1,85 @@
+from __future__ import annotations
 
+import asyncio
+import ipaddress
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yt_dlp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in (os.getenv("ADMIN_IDS") or "").replace(";", ",").split(",")
+    if x.strip().isdigit()
+}
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "45"))
+RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "10"))
+
+DB_PATH = Path("data/bottel.db")
+DOWNLOAD_DIR = Path("downloads")
+
+URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.I)
+
+router = Router()
+pending_urls: dict[int, str] = {}
+last_request: dict[int, float] = {}
+
+TEXTS = {
+    "start": (
+        "أهلاً بك في BOTtel.\n\n"
+        "أرسل رابطاً عاماً من منصة مدعومة، وسأحاول تحميله لك.\n\n"
+        "الاستخدام فقط للمحتوى الذي تملكه أو لديك حق تحميله."
+    ),
+    "help": (
+        "طريقة الاستخدام:\n"
+        "1) أرسل رابطاً عاماً.\n"
+        "2) اختر فيديو أو صوت.\n"
+        "3) انتظر اكتمال التحميل.\n\n"
+        "الأوامر:\n"
+        "/start\n/help\n/about\n/legal\n/whoami\n/admin"
+    ),
+    "about": (
+        "BOTtel بوت تحميل وسائط من الروابط العامة باستخدام yt-dlp.\n"
+        "الدعم يعتمد على المنصة والرابط وتحديثات المواقع."
+    ),
+    "legal": (
+        "شروط الاستخدام:\n"
+        "- استخدم البوت فقط مع محتوى تملكه أو لديك حق تحميله.\n"
+        "- لا يوجد تجاوز DRM أو حسابات خاصة أو تسجيل دخول أو اشتراكات.\n"
+        "- الروابط الخاصة أو غير المصرح بها غير مدعومة."
+    ),
+    "processing": "جاري التحميل والمعالجة...",
+    "done": "تم التحميل بنجاح.",
+    "bad_url": "أرسل رابطاً صحيحاً يبدأ بـ http أو https.",
+    "blocked": "هذا الرابط مرفوض لأنه داخلي أو خاص أو غير آمن.",
+    "failed": "تعذر تحميل الرابط. تأكد أنه عام ومتاح وغير محمي.",
+    "large": "الملف أكبر من الحد المسموح.",
+    "rate": "تمهل قليلاً قبل إرسال طلب جديد.",
+    "admin_only": "هذه المنطقة للمالك فقط.",
+}
 
 
 def record(

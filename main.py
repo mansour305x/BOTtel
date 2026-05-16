@@ -16,23 +16,23 @@ from urllib.parse import urlparse
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    CallbackQuery,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
-TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+TOKEN = (
+    os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or ""
+).strip()
 
 ADMIN_IDS = {
-    int(x.strip())
-    for x in (os.getenv("ADMIN_IDS") or "").replace(";", ",").split(",")
-    if x.strip().isdigit()
+    int(value.strip())
+    for value in (os.getenv("ADMIN_IDS") or "").replace(";", ",").split(",")
+    if value.strip().isdigit()
 }
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "45"))
@@ -41,13 +41,14 @@ RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "10"))
 DB_PATH = Path("data/bottel.db")
 DOWNLOAD_DIR = Path("downloads")
 
-URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.I)
+URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 
 router = Router()
 pending_urls: dict[int, str] = {}
 last_request: dict[int, float] = {}
 
-TEXTS = {
+
+DEFAULT_TEXTS = {
     "start": (
         "أهلاً بك في BOTtel.\n\n"
         "أرسل رابطاً عاماً من منصة مدعومة، وسأحاول تحميله لك.\n\n"
@@ -59,10 +60,15 @@ TEXTS = {
         "2) اختر فيديو أو صوت.\n"
         "3) انتظر اكتمال التحميل.\n\n"
         "الأوامر:\n"
-        "/start\n/help\n/about\n/legal\n/whoami\n/admin"
+        "/start\n"
+        "/help\n"
+        "/about\n"
+        "/legal\n"
+        "/whoami\n"
+        "/admin"
     ),
     "about": (
-        "BOTtel بوت تحميل وسائط من الروابط العامة باستخدام yt-dlp.\n"
+        "BOTtel بوت تحميل وسائط من الروابط العامة باستخدام yt-dlp. "
         "الدعم يعتمد على المنصة والرابط وتحديثات المواقع."
     ),
     "legal": (
@@ -82,7 +88,153 @@ TEXTS = {
 }
 
 
-def record(
+@contextmanager
+def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def init_db() -> None:
+    with db() as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS settings("
+            "key TEXT PRIMARY KEY, "
+            "value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS users("
+            "user_id INTEGER PRIMARY KEY, "
+            "accepted INTEGER DEFAULT 0, "
+            "created_at INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS downloads("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id INTEGER, "
+            "url TEXT, "
+            "mode TEXT, "
+            "platform TEXT, "
+            "status TEXT, "
+            "error TEXT, "
+            "created_at INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS buttons("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "title TEXT, "
+            "url TEXT, "
+            "active INTEGER DEFAULT 1)"
+        )
+
+        for key, value in DEFAULT_TEXTS.items():
+            connection.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+                (f"text:{key}", value),
+            )
+
+        connection.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('max_upload_mb', ?)",
+            (str(MAX_UPLOAD_MB),),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('rate_limit_seconds', ?)",
+            (str(RATE_LIMIT_SECONDS),),
+        )
+
+
+def setting(key: str, default: str = "") -> str:
+    with db() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+    return str(row["value"]) if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def text(key: str) -> str:
+    return setting(f"text:{key}", DEFAULT_TEXTS.get(key, ""))
+
+
+def first_url(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    match = URL_RE.search(value)
+    return match.group(0).strip() if match else None
+
+
+def validate_url(url: str) -> None:
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("bad url")
+
+    host = parsed.hostname.lower().strip("[]")
+
+    if host in {"localhost", "0.0.0.0"}:
+        raise ValueError("blocked host")
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return
+
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        raise ValueError("blocked ip")
+
+
+def is_admin(user_id: int | None) -> bool:
+    return bool(user_id and user_id in ADMIN_IDS)
+
+
+def ensure_user(user_id: int) -> None:
+    with db() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO users(user_id, accepted, created_at) VALUES(?, 0, ?)",
+            (user_id, int(time.time())),
+        )
+
+
+def accepted(user_id: int) -> bool:
+    ensure_user(user_id)
+
+    with db() as connection:
+        row = connection.execute(
+            "SELECT accepted FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    return bool(row and row["accepted"])
+
+
+def accept(user_id: int) -> None:
+    ensure_user(user_id)
+
+    with db() as connection:
+        connection.execute(
+            "UPDATE users SET accepted = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def record_download(
     user_id: int,
     url: str,
     mode: str,
@@ -90,12 +242,73 @@ def record(
     status: str,
     error: str | None = None,
 ) -> None:
-    with db() as con:
-        con.execute(
-            "INSERT INTO downloads(user_id,url,mode,platform,status,error,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO downloads(user_id, url, mode, platform, status, error, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
             (user_id, url, mode, platform, status, error, int(time.time())),
         )
+
+
+def home_keyboard(user_accepted: bool = True) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if not user_accepted:
+        rows.append([
+            InlineKeyboardButton(text="✅ أوافق على الشروط", callback_data="accept")
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="📌 المساعدة", callback_data="public:help"),
+        InlineKeyboardButton(text="⚖️ الشروط", callback_data="public:legal"),
+    ])
+
+    try:
+        with db() as connection:
+            buttons = connection.execute(
+                "SELECT title, url FROM buttons WHERE active = 1 ORDER BY id DESC"
+            ).fetchall()
+
+        for button in buttons:
+            rows.append([
+                InlineKeyboardButton(
+                    text=str(button["title"]),
+                    url=str(button["url"]),
+                )
+            ])
+    except Exception:
+        pass
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def download_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎬 فيديو", callback_data="dl:video"),
+                InlineKeyboardButton(text="🎧 صوت MP3", callback_data="dl:audio"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ إلغاء", callback_data="dl:cancel")
+            ],
+        ]
+    )
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📊 إحصائيات", callback_data="admin:stats"),
+                InlineKeyboardButton(text="📝 النصوص", callback_data="admin:texts"),
+            ],
+            [
+                InlineKeyboardButton(text="⚙️ الإعدادات", callback_data="admin:settings"),
+                InlineKeyboardButton(text="🔘 الأزرار", callback_data="admin:buttons"),
+            ],
+        ]
+    )
 
 
 def pick_file(workdir: Path) -> Path:
@@ -282,9 +495,9 @@ async def cmd_addbutton(message: Message) -> None:
         await message.answer("الرابط غير صالح أو غير عام.")
         return
 
-    with db() as con:
-        con.execute(
-            "INSERT INTO buttons(title,url,active) VALUES(?,?,1)",
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO buttons(title, url, active) VALUES(?, ?, 1)",
             (title, url),
         )
 
@@ -305,8 +518,8 @@ async def cmd_delbutton(message: Message) -> None:
         await message.answer("الصيغة:\n/delbutton 1")
         return
 
-    with db() as con:
-        con.execute("UPDATE buttons SET active=0 WHERE id=?", (int(raw),))
+    with db() as connection:
+        connection.execute("UPDATE buttons SET active = 0 WHERE id = ?", (int(raw),))
 
     await message.answer("تم حذف الزر إن كان موجوداً.")
 
@@ -344,22 +557,22 @@ async def cb_admin(callback: CallbackQuery) -> None:
         return
 
     if action == "stats":
-        with db() as con:
-            total = con.execute(
-                "SELECT COUNT(*) AS c FROM downloads"
-            ).fetchone()["c"]
-            success = con.execute(
-                "SELECT COUNT(*) AS c FROM downloads WHERE status='success'"
-            ).fetchone()["c"]
-            failed = con.execute(
-                "SELECT COUNT(*) AS c FROM downloads WHERE status='failed'"
-            ).fetchone()["c"]
-            users = con.execute(
-                "SELECT COUNT(*) AS c FROM users"
-            ).fetchone()["c"]
+        with db() as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) AS count FROM downloads"
+            ).fetchone()["count"]
+            success = connection.execute(
+                "SELECT COUNT(*) AS count FROM downloads WHERE status = 'success'"
+            ).fetchone()["count"]
+            failed = connection.execute(
+                "SELECT COUNT(*) AS count FROM downloads WHERE status = 'failed'"
+            ).fetchone()["count"]
+            users = connection.execute(
+                "SELECT COUNT(*) AS count FROM users"
+            ).fetchone()["count"]
 
         await callback.message.answer(
-            "الإحصائيات:\n"
+            f"الإحصائيات:\n"
             f"الطلبات: {total}\n"
             f"ناجحة: {success}\n"
             f"فاشلة: {failed}\n"
@@ -378,11 +591,11 @@ async def cb_admin(callback: CallbackQuery) -> None:
 
     if action == "settings":
         await callback.message.answer(
-            "الإعدادات:\n"
+            f"الإعدادات:\n"
             f"max_upload_mb={setting('max_upload_mb')}\n"
             f"rate_limit_seconds={setting('rate_limit_seconds')}\n\n"
-            "تعديل:\n"
-            "/setsetting max_upload_mb 45"
+            f"تعديل:\n"
+            f"/setsetting max_upload_mb 45"
         )
         return
 
@@ -474,11 +687,11 @@ async def process(message: Message, user_id: int, url: str, mode: str) -> None:
             ),
         )
 
-        record(user_id, url, mode, platform, "success")
+        record_download(user_id, url, mode, platform, "success")
 
     except Exception as exc:
         logging.exception("download failed")
-        record(user_id, url, mode, platform, "failed", str(exc))
+        record_download(user_id, url, mode, platform, "failed", str(exc))
 
         if "too_large" in str(exc):
             await message.answer(text("large"))

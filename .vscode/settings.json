@@ -1,16 +1,6 @@
 {
   "editor.formatOnSave": true,
-  "editor.codeActionsOnSave": {
-    "source.fixAll": "explicit",
-    "source.organizeImports": "explicit"
-  },
   "files.trimTrailingWhitespace": true,
   "files.insertFinalNewline": true,
-  "typescript.preferences.includePackageJsonAutoImports": "on",
-  "javascript.preferences.includePackageJsonAutoImports": "on",
-  "github.copilot.chat.codeGeneration.instructions": [
-    {
-      "text": "Deliver complete production-ready work, not basic examples. Inspect the repo, follow existing architecture, implement fully, add error handling, validate with tests/build/lint/typecheck, fix all known issues, then summarize validation honestly."
-    }
-  ]
+  "python.analysis.typeCheckingMode": "basic"
 }

@@ -1,0 +1,4 @@
+aiogram==3.28.2
+python-dotenv>=1.0.0
+yt-dlp
+pytest>=8.0.0
